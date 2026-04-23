@@ -1,446 +1,242 @@
+"""
+鴻海 + 台積電 + 聯發科 LINE Bot
+每天早上 8:30 自動推播三雄晨報圖表
+"""
+
 import os
-import requests
-import yfinance as yf
-import xml.etree.ElementTree as ET
-from urllib.parse import quote
-
-from dotenv import load_dotenv
+import threading
 from flask import Flask, request, abort
-
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
-    Configuration,
-    ApiClient,
-    MessagingApi,
-    ReplyMessageRequest,
-    PushMessageRequest,
-    TextMessage,
-    ImageMessage,
+    Configuration, ApiClient, MessagingApi,
+    ReplyMessageRequest, PushMessageRequest,
+    TextMessage
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent, FollowEvent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
+from stock_analyzer import StockAnalyzer, WATCH_LIST
+from scheduler import setup_scheduler
 from dividend_calendar import DividendCalendar
+from news_monitor import NewsMonitor
+from stock_screener import StockScreener
+
+dividend_cal = DividendCalendar()
+news_mon     = NewsMonitor()
+screener     = StockScreener()
+from line_messenger import LineMessenger
 from chart_generator import ChartGenerator
-
-try:
-    import anthropic
-except Exception:
-    anthropic = None
-
+from dotenv import load_dotenv
 
 load_dotenv()
 
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "").strip()
-
-TARGET_USER_ID = os.getenv("TARGET_USER_ID", "").strip()
-PUSH_TARGET_USER_IDS_RAW = os.getenv("push_target_user_ids", "").strip()
-
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-latest").strip()
-
-if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
-    raise ValueError("請先設定 LINE_CHANNEL_ACCESS_TOKEN 與 LINE_CHANNEL_SECRET")
-
-
-def parse_push_target_user_ids() -> list[str]:
-    ids = []
-
-    if TARGET_USER_ID:
-        ids.append(TARGET_USER_ID)
-
-    if PUSH_TARGET_USER_IDS_RAW:
-        ids.extend([x.strip() for x in PUSH_TARGET_USER_IDS_RAW.split(",") if x.strip()])
-
-    seen = set()
-    result = []
-    for uid in ids:
-        if uid not in seen:
-            seen.add(uid)
-            result.append(uid)
-
-    return result
-
-
-PUSH_TARGET_USER_IDS = parse_push_target_user_ids()
-
-print("TARGET_USER_ID =", repr(TARGET_USER_ID))
-print("push_target_user_ids raw =", repr(PUSH_TARGET_USER_IDS_RAW))
-print("PUSH_TARGET_USER_IDS =", PUSH_TARGET_USER_IDS)
-print("ANTHROPIC_API_KEY exists =", bool(ANTHROPIC_API_KEY))
-
 app = Flask(__name__)
 
-configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
+configuration = Configuration(access_token=os.environ["LINE_CHANNEL_ACCESS_TOKEN"])
+handler       = WebhookHandler(os.environ["LINE_CHANNEL_SECRET"])
+
+analyzer  = StockAnalyzer()
+messenger = LineMessenger(os.environ["LINE_CHANNEL_ACCESS_TOKEN"])
+charter   = ChartGenerator()
 
 
-STOCK_ALIAS = {
-    "鴻海": ("2317.TW", "鴻海"),
-    "2317": ("2317.TW", "鴻海"),
-    "2317.tw": ("2317.TW", "鴻海"),
-
-    "台積電": ("2330.TW", "台積電"),
-    "2330": ("2330.TW", "台積電"),
-    "2330.tw": ("2330.TW", "台積電"),
-    "tsmc": ("2330.TW", "台積電"),
-
-    "聯發科": ("2454.TW", "聯發科"),
-    "2454": ("2454.TW", "聯發科"),
-    "2454.tw": ("2454.TW", "聯發科"),
-    "mediatek": ("2454.TW", "聯發科"),
-}
-
-NEWS_QUERY_ALIAS = {
-    "鴻海": '"鴻海" OR "Foxconn" OR "2317"',
-    "台積電": '"台積電" OR "TSMC" OR "2330"',
-    "聯發科": '"聯發科" OR "MediaTek" OR "2454"',
-}
-
-
-def normalize_stock_keyword(text: str):
-    key = text.strip().lower()
-    return STOCK_ALIAS.get(key)
-
-
-def reply_text(reply_token: str, text: str):
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=reply_token,
-                messages=[TextMessage(text=text[:5000])]
-            )
-        )
-
-
-def reply_messages(reply_token: str, messages: list):
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=reply_token,
-                messages=messages
-            )
-        )
-
-
-def push_text(to_user_id: str, text: str):
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.push_message(
-            PushMessageRequest(
-                to=to_user_id,
-                messages=[TextMessage(text=text[:5000])]
-            )
-        )
-
-
-def push_text_to_all(user_ids: list[str], text: str):
-    for uid in user_ids:
-        push_text(uid, text)
-
-
-def get_help_text() -> str:
-    return (
-        "可用指令：\n"
-        "1. 功能\n"
-        "2. ping\n"
-        "3. 我的ID\n"
-        "4. 今年股利\n"
-        "5. 新聞 鴻海\n"
-        "6. 新聞 台積電\n"
-        "7. 新聞 聯發科\n"
-        "8. 三雄\n"
-        "9. 推播名單\n"
-        "10. 推播測試"
-    )
-
-
-def fetch_news_rss(keyword: str, limit: int = 5) -> list[dict]:
-    stock = normalize_stock_keyword(keyword)
-
-    if stock:
-        _ticker, name = stock
-        if name in NEWS_QUERY_ALIAS:
-            query = f'({NEWS_QUERY_ALIAS[name]}) (台股 OR 股票 OR 財報 OR 法說會 OR 半導體)'
-        else:
-            query = f'"{name}" 台股 OR 股票'
-    else:
-        query = f'"{keyword}" 台股 OR 股票'
-
-    q = quote(query)
-    url = f"https://news.google.com/rss/search?q={q}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-
-    resp = requests.get(url, timeout=15)
-    resp.raise_for_status()
-
-    root = ET.fromstring(resp.content)
-    items = root.findall(".//item")
-
-    news = []
-    for item in items[:limit]:
-        title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        pub_date = (item.findtext("pubDate") or "").strip()
-        news.append({
-            "title": title,
-            "link": link,
-            "pub_date": pub_date,
-        })
-    return news
-
-
-def summarize_news(keyword: str, news_items: list[dict]) -> str:
-    if not news_items:
-        return f"目前找不到「{keyword}」的近期新聞"
-
-    headlines = "\n".join([f"{i+1}. {item['title']}" for i, item in enumerate(news_items)])
-
-    if not ANTHROPIC_API_KEY or anthropic is None:
-        return (
-            f"【{keyword} 新聞重點】\n"
-            f"{headlines}\n\n"
-            "未設定 ANTHROPIC_API_KEY，先顯示新聞標題。"
-        )
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-    prompt = f"""
-你是台股資訊摘要助手。
-請根據以下新聞標題，用繁體中文整理：
-1. 3點重點摘要
-2. 市場可能關注什麼
-3. 不要亂編，僅依標題合理整理
-4. 控制在 180 字內
-
-公司：{keyword}
-
-新聞標題：
-{headlines}
-"""
-
-    msg = client.messages.create(
-        model=ANTHROPIC_MODEL,
-        max_tokens=300,
-        temperature=0.2,
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    summary_text = ""
-    for block in msg.content:
-        if getattr(block, "type", "") == "text":
-            summary_text += block.text
-
-    return f"【{keyword} AI 新聞摘要】\n{summary_text.strip()}"
-
-
-def fetch_comparison_data() -> dict:
-    tickers = ["2317.TW", "2330.TW", "2454.TW"]
-    result = {}
-
-    for ticker in tickers:
-        df = yf.download(
-            ticker,
-            period="3mo",
-            interval="1d",
-            progress=False,
-            auto_adjust=False
-        )
-
-        if df.empty:
-            continue
-
-        close_data = df["Close"]
-        volume_data = df["Volume"]
-
-        if hasattr(close_data, "iloc") and getattr(close_data, "ndim", 1) == 2:
-            close_data = close_data.iloc[:, 0]
-
-        if hasattr(volume_data, "iloc") and getattr(volume_data, "ndim", 1) == 2:
-            volume_data = volume_data.iloc[:, 0]
-
-        closes = close_data.dropna().tolist()
-        volumes = volume_data.fillna(0).tolist()
-        dates = df.index.to_pydatetime().tolist()
-
-        if len(closes) < 2:
-            continue
-
-        change_pct = ((closes[-1] - closes[-2]) / closes[-2]) * 100
-
-        result[ticker] = {
-            "closes": closes,
-            "volumes": volumes,
-            "dates": dates,
-            "change_pct": change_pct,
-        }
-
-    return result
-
-
-@app.route("/", methods=["GET"])
-def home():
-    return "LINE bot is running", 200
-
-
+# ─────────────────────────────────────────
+# Webhook
+# ─────────────────────────────────────────
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
-
-    print("=== webhook received ===")
-    print(body)
-
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        print("invalid signature")
         abort(400)
-    except Exception as e:
-        app.logger.exception("handle webhook error: %s", e)
-        return "Internal Error", 500
-
-    return "OK", 200
-
-
-@handler.add(FollowEvent)
-def handle_follow(event):
-    user_id = getattr(event.source, "user_id", None)
-    print("FOLLOW user_id =", user_id)
-    reply_text(event.reply_token, "歡迎加入！\n輸入「功能」查看可用指令。")
+    return "OK"
 
 
 @handler.add(MessageEvent, message=TextMessageContent)
-def handle_text_message(event):
-    text = (event.message.text or "").strip()
-    user_id = getattr(event.source, "user_id", None)
+def handle_message(event):
+    text = event.message.text.strip()
 
-    print("MESSAGE user_id =", user_id)
-    print("TEXT =", text)
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
 
-    if text in ["功能", "help", "Help", "HELP"]:
-        reply_text(event.reply_token, get_help_text())
-        return
+        # ── 指令路由 ──
+        if text in ["鴻海", "2317"]:
+            reply_stock(api, event, "2317.TW")
 
-    if text == "ping":
-        reply_text(event.reply_token, "pong")
-        return
+        elif text in ["台積電", "2330"]:
+            reply_stock(api, event, "2330.TW")
 
-    if text == "我的ID":
-        if user_id:
-            reply_text(event.reply_token, f"你的 LINE userId：\n{user_id}")
+        elif text in ["聯發科", "2454"]:
+            reply_stock(api, event, "2454.TW")
+
+        elif text in ["三雄", "比較", "圖"]:
+            reply_comparison_chart(api, event)
+
+        elif text in ["選股", "推薦", "潛力股", "未來5天", "看好"]:
+            api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text="🔍 掃描台股潛力股中，約需 30 秒，完成後推播...")]))
+
+            def _screen():
+                result   = screener.screen_top5()
+                msg_text = screener.format_for_line(result)
+                with ApiClient(configuration) as ac:
+                    MessagingApi(ac).push_message(PushMessageRequest(
+                        to=event.source.user_id,
+                        messages=[TextMessage(text=msg_text)]))
+            threading.Thread(target=_screen, daemon=True).start()
+
+        elif text in ["外部", "總經", "情報", "美股", "新聞分析"]:
+            # 產出需要時間，先 reply 再背景產出 push
+            api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text="🌐 分析外部市場情報中，約 10 秒後推播...")]))
+
+            def _gen_intel():
+                intel    = news_mon.get_market_intelligence()
+                msg_text = news_mon.format_for_line(intel)
+                with ApiClient(configuration) as ac:
+                    MessagingApi(ac).push_message(PushMessageRequest(
+                        to=event.source.user_id,
+                        messages=[TextMessage(text=msg_text)]))
+            threading.Thread(target=_gen_intel, daemon=True).start()
+
+        elif text in ["股利", "除息", "行事曆", "配息"]:
+            msg = dividend_cal.format_upcoming_for_line(days=90)
+            api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=msg)]))
+
+        elif text.startswith("股利"):
+            ticker = parse_stock_from_text(text)
+            msg = dividend_cal.format_stock_events(ticker)
+            api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=msg)]))
+
+        elif text == "量":
+            reply_volume_summary(api, event)
+
+        elif text.startswith("週線"):
+            # 週線 2317 / 週線 台積電
+            ticker = parse_stock_from_text(text)
+            report = analyzer.get_weekly_report(ticker)
+            flex   = messenger.build_flex_message(report)
+            api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token, messages=[flex]))
+
+        elif text.startswith("新聞"):
+            ticker = parse_stock_from_text(text)
+            news   = analyzer.get_news_summary(ticker)
+            api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=news)]))
+
+        elif text == "幫助":
+            api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=HELP_TEXT)]))
+
         else:
-            reply_text(event.reply_token, "目前拿不到 userId")
-        return
-
-    if text in ["今年股利", "股利", "股利總覽"]:
-        cal = DividendCalendar()
-        reply_text(event.reply_token, cal.format_2026_payouts_for_line())
-        return
-
-    if text in ["新聞 鴻海", "鴻海新聞"]:
-        keyword = "鴻海"
-        try:
-            news_items = fetch_news_rss(keyword, limit=5)
-            summary = summarize_news(keyword, news_items)
-            reply_text(event.reply_token, summary)
-        except Exception as e:
-            app.logger.exception("news error: %s", e)
-            reply_text(event.reply_token, f"新聞查詢失敗：{e}")
-        return
-
-    if text in ["新聞 台積電", "台積電新聞"]:
-        keyword = "台積電"
-        try:
-            news_items = fetch_news_rss(keyword, limit=5)
-            summary = summarize_news(keyword, news_items)
-            reply_text(event.reply_token, summary)
-        except Exception as e:
-            app.logger.exception("news error: %s", e)
-            reply_text(event.reply_token, f"新聞查詢失敗：{e}")
-        return
-
-    if text in ["新聞 聯發科", "聯發科新聞"]:
-        keyword = "聯發科"
-        try:
-            news_items = fetch_news_rss(keyword, limit=5)
-            summary = summarize_news(keyword, news_items)
-            reply_text(event.reply_token, summary)
-        except Exception as e:
-            app.logger.exception("news error: %s", e)
-            reply_text(event.reply_token, f"新聞查詢失敗：{e}")
-        return
-
-    # 保留通用格式：新聞 XXX
-    if text.startswith("新聞 "):
-        keyword = text.replace("新聞", "", 1).strip()
-        if not keyword:
-            reply_text(event.reply_token, "請輸入：新聞 鴻海")
-            return
-
-        try:
-            news_items = fetch_news_rss(keyword, limit=5)
-            summary = summarize_news(keyword, news_items)
-            reply_text(event.reply_token, summary)
-        except Exception as e:
-            app.logger.exception("news error: %s", e)
-            reply_text(event.reply_token, f"新聞查詢失敗：{e}")
-        return
-
-    if text in ["三雄", "圖表", "比較圖"]:
-        try:
-            data = fetch_comparison_data()
-            if not data:
-                reply_text(event.reply_token, "目前抓不到股價資料，請稍後再試。")
-                return
-
-            chart = ChartGenerator()
-            image_url = chart.generate_comparison_chart(data)
-
-            reply_messages(
-                event.reply_token,
-                [
-                    TextMessage(text="這是台股三雄近期比較圖"),
-                    ImageMessage(
-                        original_content_url=image_url,
-                        preview_image_url=image_url
-                    )
-                ]
-            )
-        except Exception as e:
-            app.logger.exception("chart error: %s", e)
-            reply_text(event.reply_token, f"產生圖表失敗：{e}")
-        return
-
-    if text == "推播名單":
-        if not PUSH_TARGET_USER_IDS:
-            reply_text(event.reply_token, "目前沒有可用的推播對象")
-        else:
-            reply_text(event.reply_token, "目前推播對象：\n" + "\n".join(PUSH_TARGET_USER_IDS))
-        return
-
-    if text == "推播測試":
-        if not PUSH_TARGET_USER_IDS:
-            reply_text(event.reply_token, "尚未設定 TARGET_USER_ID 或 push_target_user_ids")
-            return
-
-        try:
-            push_text_to_all(PUSH_TARGET_USER_IDS, "這是一則推播測試訊息")
-            reply_text(event.reply_token, f"已送出推播測試，共 {len(PUSH_TARGET_USER_IDS)} 個對象")
-        except Exception as e:
-            app.logger.exception("push error: %s", e)
-            reply_text(event.reply_token, f"推播失敗：{e}")
-        return
-
-    reply_text(
-        event.reply_token,
-        "目前支援的指令：\n"
-        "功能\nping\n我的ID\n今年股利\n新聞 鴻海\n新聞 台積電\n新聞 聯發科\n三雄\n推播名單\n推播測試"
-    )
+            # 讓使用者知道可以輸入什麼
+            api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text="輸入「幫助」查看所有指令 🤖")]))
 
 
+# ─────────────────────────────────────────
+# 指令處理 helpers
+# ─────────────────────────────────────────
+def reply_stock(api, event, ticker: str):
+    """單股 Flex 卡片"""
+    report = analyzer.get_daily_report(ticker)
+    flex   = messenger.build_flex_message(report)
+    api.reply_message(ReplyMessageRequest(
+        reply_token=event.reply_token, messages=[flex]))
+
+
+def reply_comparison_chart(api, event):
+    """三雄比較圖 + 文字摘要"""
+    # 先回覆「準備中」避免 webhook 超時
+    api.reply_message(ReplyMessageRequest(
+        reply_token=event.reply_token,
+        messages=[TextMessage(text="📊 產出三雄比較圖中，請稍候 5 秒...")]))
+
+    # 背景產圖後 push
+    def _gen_and_push():
+        stocks_data = analyzer.get_all_stocks_data()
+        img_url_or_path = charter.generate_comparison_chart(stocks_data)
+
+        summaries = analyzer.get_multi_summary()
+        text_msg  = messenger.build_multi_summary_text(summaries)
+        img_msg   = messenger.build_image_message(img_url_or_path)
+
+        target_id = event.source.user_id
+        with ApiClient(configuration) as ac:
+            MessagingApi(ac).push_message(PushMessageRequest(
+                to=target_id, messages=[img_msg, text_msg]))
+
+    threading.Thread(target=_gen_and_push, daemon=True).start()
+
+
+def reply_volume_summary(api, event):
+    """三股量能快報（文字）"""
+    summaries = analyzer.get_multi_summary()
+    text = messenger.build_multi_summary_text(summaries)
+    api.reply_message(ReplyMessageRequest(
+        reply_token=event.reply_token,
+        messages=[TextMessage(text=text)]))
+
+
+def parse_stock_from_text(text: str) -> str:
+    """從指令文字解析 ticker"""
+    mapping = {
+        "鴻海": "2317.TW", "2317": "2317.TW",
+        "台積電": "2330.TW", "2330": "2330.TW",
+        "聯發科": "2454.TW", "2454": "2454.TW",
+    }
+    for key, val in mapping.items():
+        if key in text:
+            return val
+    return "2317.TW"  # 預設鴻海
+
+
+HELP_TEXT = (
+    "📊 台股三雄 Bot 完整指令\n\n"
+    "─── 單股行情 ───\n"
+    "🔹 鴻海 / 台積電 / 聯發科\n\n"
+    "─── 比較 & 圖表 ───\n"
+    "🔹 三雄 / 圖 → 三股比較圖\n"
+    "🔹 量 → 量能快報\n"
+    "🔹 週線 鴻海 → 近5日走勢\n\n"
+    "─── 選股 ───\n"
+    "🔹 選股 / 推薦 / 潛力股\n"
+    "   → 掃描50檔台股，AI推薦\n"
+    "     未來5天最具潛力的5檔\n\n"
+    "─── 外部情報 ───\n"
+    "🔹 外部 / 總經 / 情報\n"
+    "   → NASDAQ/SOX/VIX + 新聞AI分析\n"
+    "🔹 新聞 台積電 → 個股新聞摘要\n\n"
+    "─── 股利行事曆 ───\n"
+    "🔹 股利 / 除息 → 三雄股利總覽\n\n"
+    "─── 自動推播 ───\n"
+    "⏰ 08:30 三雄晨報圖表\n"
+    "⏰ 08:31 股利日期提醒\n"
+    "⏰ 08:45 外部情報 + AI分析\n"
+    "🔍 09:00 每週一次選股推薦\n"
+    "🔔 09:00–13:35 盤中訊號掃描\n"
+    "📋 14:00 收盤法人動向\n"
+    "🇺🇸 21:00 美股盤中情報"
+)
+
+
+# ─────────────────────────────────────────
+# 啟動
+# ─────────────────────────────────────────
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    sched = setup_scheduler(analyzer, messenger, charter)
+    sched.start()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
