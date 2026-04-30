@@ -258,51 +258,28 @@ class StockScreener:
         return {}
 
     # ═══════════════════════════════════════════════════════
-    # Layer 3：抓個股新聞
+    # Layer 3：抓個股新聞（只用 Google News RSS）
     # ═══════════════════════════════════════════════════════
     def _fetch_stock_news(self, ticker: str, name: str) -> list[dict]:
-        items = []
-        stock_id = ticker.replace(".TW", "")
+        import urllib.parse
+        items   = []
+        queries = [f"{name} 股票 營收", f"{name} 訂單 財報"]
 
-        # Google News（中文優先）
-        queries = [
-            f"{name} 股票 財報",
-            f"{name} 訂單 營收",
-            f"{stock_id} {name}",
-        ]
-        for q in queries[:2]:
+        for q in queries:
             try:
-                url  = f"https://news.google.com/rss/search?q={requests.utils.quote(q)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+                url  = f"https://news.google.com/rss/search?q={urllib.parse.quote(q)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
                 feed = feedparser.parse(url)
                 for entry in feed.entries[:3]:
-                    title   = entry.get("title", "")
-                    summary = re.sub(r"<[^>]+>", "", entry.get("summary", ""))[:150]
-                    items.append({
-                        "title":   title,
-                        "summary": summary,
-                        "source":  "Google 新聞",
-                        "time":    entry.get("published", ""),
-                    })
+                    title   = re.sub(r"<[^>]+>", "", entry.get("title", ""))
+                    summary = re.sub(r"<[^>]+>", "", entry.get("summary", ""))[:120]
+                    if title:
+                        items.append({
+                            "title":   title,
+                            "summary": summary,
+                            "source":  "Google新聞",
+                        })
             except Exception:
                 pass
-
-        # yfinance 內建新聞（可用時補充）
-        try:
-            import yfinance as yf
-            news = yf.Ticker(ticker).get_news(count=4)
-            for n in (news or []):
-                content = n.get("content", {})
-                title   = content.get("title", n.get("title", ""))
-                summary = content.get("summary", "")[:150]
-                if title:
-                    items.append({
-                        "title":   title,
-                        "summary": summary,
-                        "source":  "Yahoo Finance",
-                        "time":    content.get("pubDate", ""),
-                    })
-        except Exception:
-            pass
 
         # 去重
         seen, unique = set(), []
@@ -312,7 +289,7 @@ class StockScreener:
                 seen.add(key)
                 unique.append(item)
 
-        return unique[:6]
+        return unique[:5]
 
     # ═══════════════════════════════════════════════════════
     # Layer 4：Claude 深度評級
