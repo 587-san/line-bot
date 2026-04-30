@@ -1,3 +1,3 @@
-git add line_messenger.py
-git commit -m "add line_messenger module"
-git push
+class LineMessenger:
+    def __init__(self):
+        pass
