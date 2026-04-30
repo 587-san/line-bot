@@ -30,14 +30,16 @@ import time
 import json
 import requests
 import feedparser
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import anthropic
 
-TZ = ZoneInfo("Asia/Taipei")
+from data_fetcher import DataFetcher
+
+TZ      = ZoneInfo("Asia/Taipei")
+fetcher = DataFetcher()
 
 # ═══════════════════════════════════════════════════════
 # 股票基本資料庫（產品 + 競爭地位）
@@ -266,13 +268,8 @@ class StockScreener:
                 or GENERIC_PROFILES.get(ticker, ("",))[0]
                 or ticker)
 
-        try:
-            t  = yf.Ticker(ticker)
-            df = t.history(period="40d", timeout=10)
-        except Exception:
-            return None
-
-        if df.empty or len(df) < 10:
+        df = fetcher.get_history(ticker, days=40)
+        if df is None or df.empty or len(df) < 10:
             return None
 
         closes  = df["Close"].values
@@ -361,8 +358,9 @@ class StockScreener:
             except Exception:
                 pass
 
-        # yfinance 內建新聞
+        # yfinance 內建新聞（可用時補充）
         try:
+            import yfinance as yf
             news = yf.Ticker(ticker).get_news(count=4)
             for n in (news or []):
                 content = n.get("content", {})

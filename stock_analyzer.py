@@ -14,6 +14,7 @@ import numpy as np
 from datetime import datetime
 import anthropic
 from dotenv import load_dotenv
+from data_fetcher import DataFetcher
 load_dotenv()
 
 WATCH_LIST = {
@@ -28,6 +29,8 @@ TWSE_ID_MAP = {
     "2454.TW": "2454",
 }
 
+_fetcher = DataFetcher()
+
 
 class StockAnalyzer:
 
@@ -38,8 +41,8 @@ class StockAnalyzer:
         result = {}
         for ticker in WATCH_LIST:
             try:
-                df = yf.Ticker(ticker).history(period="30d")
-                if df.empty:
+                df = _fetcher.get_history(ticker, days=30)
+                if df is None or df.empty:
                     continue
                 closes  = df["Close"].tolist()
                 volumes = df["Volume"].tolist()
@@ -57,10 +60,9 @@ class StockAnalyzer:
         return result
 
     def get_daily_report(self, ticker: str = "2317.TW") -> dict:
-        stock = yf.Ticker(ticker)
-        df    = stock.history(period="30d")
+        df = _fetcher.get_history(ticker, days=30)
 
-        if df.empty:
+        if df is None or df.empty:
             return {"error": f"無法取得 {ticker} 資料"}
 
         latest = df.iloc[-1]
@@ -117,10 +119,9 @@ class StockAnalyzer:
         return summaries
 
     def get_weekly_report(self, ticker: str = "2317.TW") -> dict:
-        stock = yf.Ticker(ticker)
-        df    = stock.history(period="15d")
+        df = _fetcher.get_history(ticker, days=15)
 
-        if df.empty:
+        if df is None or df.empty:
             return {"error": "無法取得資料"}
 
         df = df.tail(6)
@@ -144,18 +145,13 @@ class StockAnalyzer:
         }
 
     def get_news_summary(self, ticker: str = "2317.TW") -> str:
-        stock = yf.Ticker(ticker)
-        news  = stock.news
-
-        if not news:
-            return f"目前無最新新聞"
-
-        headlines = "\n".join([
-            f"- {n.get('content', {}).get('title', n.get('title', ''))}"
-            for n in news[:6]
-        ])
-
+        # yfinance 新聞在 Railway 可能失敗，改用 Google News RSS 補充
+        headlines = self._fetch_news_headlines(ticker)
         name = WATCH_LIST.get(ticker, ticker)
+
+        if not headlines:
+            return f"⚠️ 目前無法取得 {name} 最新新聞"
+
         msg = self.client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=500,
@@ -170,6 +166,28 @@ class StockAnalyzer:
             }]
         )
         return f"📰 {name} 最新動態\n\n{msg.content[0].text}"
+
+    def _fetch_news_headlines(self, ticker: str) -> str:
+        """Google News RSS 抓新聞標題（Railway 可用）"""
+        import feedparser, re as _re
+        name = WATCH_LIST.get(ticker, ticker.replace(".TW", ""))
+        stock_id = ticker.replace(".TW", "")
+        headlines = []
+
+        queries = [f"{name} 股票", f"{stock_id} {name} 財報"]
+        for q in queries:
+            try:
+                import urllib.parse
+                url  = f"https://news.google.com/rss/search?q={urllib.parse.quote(q)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+                feed = feedparser.parse(url)
+                for entry in feed.entries[:3]:
+                    title = _re.sub(r"<[^>]+>", "", entry.get("title", ""))
+                    if title:
+                        headlines.append(f"- {title}")
+            except Exception:
+                pass
+
+        return "\n".join(headlines[:6])
 
     def _get_twse_institutional(self, stock_id: str) -> dict:
         if not stock_id:
