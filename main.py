@@ -57,90 +57,93 @@ def callback():
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     text = event.message.text.strip()
+    # 正規化：去除空格、全形轉半形、統一小寫
+    t = text.replace("　", "").replace(" ", "").replace("/", "").replace("＆", "").replace("&", "").lower()
 
     with ApiClient(configuration) as api_client:
         api = MessagingApi(api_client)
 
-        # ── 指令路由 ──
-        if text in ["鴻海", "2317"]:
+        # ── 指令路由（用 keyword 包含判斷，更寬鬆）──
+        if t in ["鴻海", "2317"]:
             reply_stock(api, event, "2317.TW")
 
-        elif text in ["台積電", "2330"]:
+        elif t in ["台積電", "2330"]:
             reply_stock(api, event, "2330.TW")
 
-        elif text in ["聯發科", "2454"]:
+        elif t in ["聯發科", "2454"]:
             reply_stock(api, event, "2454.TW")
 
-        elif text in ["三雄", "比較", "圖"]:
+        elif any(k in t for k in ["三雄", "比較", "圖表"]) or t == "圖":
             reply_comparison_chart(api, event)
 
-        elif text in ["選股", "推薦", "潛力股", "未來5天", "看好"]:
+        elif any(k in t for k in ["選股", "推薦", "潛力股", "未來5天", "看好"]):
             api.reply_message(ReplyMessageRequest(
                 reply_token=event.reply_token,
-                messages=[TextMessage(text="🔍 掃描台股潛力股中，約需 30 秒，完成後推播...")]))
+                messages=[TextMessage(text="🔍 掃描台股潛力股中，約需 40 秒，完成後推播...")]))
 
             def _screen():
-                result   = screener.screen_top5()
-                msg_text = screener.format_for_line(result)
+                try:
+                    result   = screener.screen_top5()
+                    msg_text = screener.format_for_line(result)
+                except Exception as e:
+                    msg_text = f"⚠️ 選股分析失敗：{str(e)[:100]}\n請稍後再試或傳「潛力股」重新觸發"
                 with ApiClient(configuration) as ac:
                     MessagingApi(ac).push_message(PushMessageRequest(
                         to=event.source.user_id,
                         messages=[TextMessage(text=msg_text)]))
             threading.Thread(target=_screen, daemon=True).start()
 
-        elif text in ["外部", "總經", "情報", "美股", "新聞分析"]:
-            # 產出需要時間，先 reply 再背景產出 push
+        elif any(k in t for k in ["外部", "總經", "情報", "美股", "新聞分析"]):
             api.reply_message(ReplyMessageRequest(
                 reply_token=event.reply_token,
-                messages=[TextMessage(text="🌐 分析外部市場情報中，約 10 秒後推播...")]))
+                messages=[TextMessage(text="🌐 分析外部市場情報中，約 15 秒後推播...")]))
 
             def _gen_intel():
-                intel    = news_mon.get_market_intelligence()
-                msg_text = news_mon.format_for_line(intel)
+                try:
+                    intel    = news_mon.get_market_intelligence()
+                    msg_text = news_mon.format_for_line(intel)
+                except Exception as e:
+                    msg_text = f"⚠️ 情報分析失敗：{str(e)[:100]}"
                 with ApiClient(configuration) as ac:
                     MessagingApi(ac).push_message(PushMessageRequest(
                         to=event.source.user_id,
                         messages=[TextMessage(text=msg_text)]))
             threading.Thread(target=_gen_intel, daemon=True).start()
 
-        elif text in ["股利", "除息", "行事曆", "配息"]:
-            msg = dividend_cal.format_upcoming_for_line(days=90)
+        elif any(k in t for k in ["股利", "除息", "行事曆", "配息"]) and not t.startswith("新聞"):
+            # 「股利 鴻海」→ 單股；單純「股利」→ 總覽
+            if any(k in t for k in ["鴻海", "2317", "台積電", "2330", "聯發科", "2454"]):
+                ticker = parse_stock_from_text(text)
+                msg = dividend_cal.format_stock_events(ticker)
+            else:
+                msg = dividend_cal.format_upcoming_for_line(days=90)
             api.reply_message(ReplyMessageRequest(
                 reply_token=event.reply_token,
                 messages=[TextMessage(text=msg)]))
 
-        elif text.startswith("股利"):
-            ticker = parse_stock_from_text(text)
-            msg = dividend_cal.format_stock_events(ticker)
-            api.reply_message(ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=msg)]))
-
-        elif text == "量":
+        elif t == "量":
             reply_volume_summary(api, event)
 
-        elif text.startswith("週線"):
-            # 週線 2317 / 週線 台積電
+        elif t.startswith("週線"):
             ticker = parse_stock_from_text(text)
             report = analyzer.get_weekly_report(ticker)
             flex   = messenger.build_flex_message(report)
             api.reply_message(ReplyMessageRequest(
                 reply_token=event.reply_token, messages=[flex]))
 
-        elif text.startswith("新聞"):
-            ticker = parse_stock_from_text(text)
-            news   = analyzer.get_news_summary(ticker)
+        elif t.startswith("新聞"):
+            ticker  = parse_stock_from_text(text)
+            news    = analyzer.get_news_summary(ticker)
             api.reply_message(ReplyMessageRequest(
                 reply_token=event.reply_token,
                 messages=[TextMessage(text=news)]))
 
-        elif text == "幫助":
+        elif t in ["幫助", "help", "指令", "說明"]:
             api.reply_message(ReplyMessageRequest(
                 reply_token=event.reply_token,
                 messages=[TextMessage(text=HELP_TEXT)]))
 
         else:
-            # 讓使用者知道可以輸入什麼
             api.reply_message(ReplyMessageRequest(
                 reply_token=event.reply_token,
                 messages=[TextMessage(text="輸入「幫助」查看所有指令 🤖")]))

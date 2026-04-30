@@ -206,7 +206,6 @@ class StockScreener:
     # ═══════════════════════════════════════════════════════
     def screen_top5(self) -> dict:
         all_tickers = list(STOCK_PROFILES.keys()) + list(GENERIC_PROFILES.keys())
-        # 去重
         all_tickers = list(dict.fromkeys(all_tickers))
 
         print(f"[選股 Layer1] 量化初篩 {len(all_tickers)} 檔...")
@@ -216,12 +215,17 @@ class StockScreener:
                 r = self._quantitative_score(ticker)
                 if r:
                     scored.append(r)
-                time.sleep(0.25)
             except Exception as e:
                 print(f"  ⚠️ {ticker}: {e}")
+            time.sleep(0.4)  # Railway 上放慢，避免 yfinance 限速
 
         if not scored:
-            return {"top5": [], "ai_analysis": "資料取得失敗，請稍後再試", "scanned_at": ""}
+            return {
+                "top5": [],
+                "ai_analysis": "⚠️ 股票資料暫時無法取得（yfinance 服務受限）\n請 5 分鐘後再試，或傳「潛力股」重新觸發",
+                "scanned_at": datetime.now(TZ).strftime("%Y/%m/%d %H:%M"),
+                "total_scanned": 0,
+            }
 
         scored.sort(key=lambda x: x["quant_score"], reverse=True)
         top10 = scored[:10]
@@ -262,8 +266,12 @@ class StockScreener:
                 or GENERIC_PROFILES.get(ticker, ("",))[0]
                 or ticker)
 
-        t  = yf.Ticker(ticker)
-        df = t.history(period="40d")
+        try:
+            t  = yf.Ticker(ticker)
+            df = t.history(period="40d", timeout=10)
+        except Exception:
+            return None
+
         if df.empty or len(df) < 10:
             return None
 
