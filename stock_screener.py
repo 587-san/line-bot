@@ -374,7 +374,7 @@ PRE-SCREENED DATA:
 OUTPUT (全程繁體中文):
 
 📊 台股選股報告｜{today}
-掃描 {len(scored_count)} 檔 → 精選前 {len(stocks)} 檔深度分析
+掃描 {scored_count} 檔 → 精選前 {len(stocks)} 檔深度分析
 
 {"═"*30}
 
