@@ -390,6 +390,7 @@ class StockScreener:
     # Layer 4：Claude 深度評級
     # ═══════════════════════════════════════════════════════
     def _claude_deep_grade(self, stocks: list) -> dict:
+        total_stocks = len(STOCK_PROFILES) + len(GENERIC_PROFILES)
         today = datetime.now(TZ).strftime("%Y-%m-%d")
 
         # 為每檔整理完整資料
@@ -457,7 +458,7 @@ PRE-SCREENED DATA:
 OUTPUT FORMAT (entirely in Traditional Chinese):
 
 📊 台股深度選股報告
-📅 {today}  掃描 {len(stocks)} 檔（初篩自 {len(STOCK_PROFILES)+len(GENERIC_PROFILES)} 檔）
+📅 {today}  掃描 {len(stocks)} 檔（初篩自 {total_stocks} 檔）
 
 ══════════════════════════
 🏆 未來5日推薦 Top 5
@@ -465,7 +466,7 @@ OUTPUT FORMAT (entirely in Traditional Chinese):
 
 [依序列出5檔，每檔格式如下]
 
-▋ #排名  股票名稱（代號）  ${price}  評級：X
+▋ #排名  股票名稱（代號）  $收盤價  評級：X
    ─────────────────────
    📦 產品與業務分析
    （說明核心產品、市場地位、目前在產業週期的位置，3-4句）
