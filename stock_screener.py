@@ -1,33 +1,18 @@
 """
-台股深度選股模組
+台股深度選股模組（10分鐘深度版）
 ────────────────────────────────────────────────────────
-分析層次（由淺到深）：
-
-Layer 1  量化初篩（全市場 ~25 檔）
-  → 動能 / 量能 / 技術面 / RSI 評分
-  → 淘汰明顯弱勢，留下 Top 10
-
-Layer 2  產品與業務深度分析（Top 10 每檔）
-  → 主要產品線與市場地位
-  → 產業景氣週期位置
-  → 競爭對手比較
-
-Layer 3  新聞抽絲剝繭（Top 10 每檔）
-  → 抓取個股近期新聞（Google News RSS + yfinance）
-  → 英文新聞：先理解原意再分析，最後翻譯結論
-  → 正面 / 負面 / 中性事件歸因
-
-Layer 4  Claude 綜合評級（Top 10 → 選出 Top 5）
-  → 英文思考：產品週期 × 技術面 × 新聞情緒
-  → 輸出繁體中文報告
-  → 評級：A+ / A / A- / B+ / B / B- / C
+Layer 1  量化初篩（35檔）→ 淘汰弱勢，留 Top 15
+Layer 2  產品週期分析（Top 15）→ 現在在哪個景氣位置
+Layer 3  Google新聞逐條解讀（Top 15）→ 訊號 vs 雜訊
+Layer 4  Claude 抽絲剝繭（英文思考 → 繁中輸出）→ 精選 Top 5
+         評級：A+ / A / A- / B+ / B / B- / C
 ────────────────────────────────────────────────────────
 """
 
 import os
 import re
 import time
-import requests
+import urllib.parse
 import feedparser
 import pandas as pd
 import numpy as np
@@ -42,77 +27,205 @@ TZ      = ZoneInfo("Asia/Taipei")
 fetcher = DataFetcher()
 
 # ═══════════════════════════════════════════════════════
-# 核心監控清單（精選15檔，速度快 + 覆蓋主要產業）
+# 監控清單（35檔，涵蓋AI/半導體/網通/電源/記憶體/封測）
 # ═══════════════════════════════════════════════════════
 STOCK_PROFILES = {
+    # ── AI 伺服器供應鏈 ──
     "2317.TW": {
-        "name": "鴻海", "sector": "AI伺服器/電子代工",
-        "products": ["GB200 NVL72 AI伺服器（NVIDIA最大組裝商）", "iPhone代工（佔營收50%）", "MIH電動車平台"],
-        "catalysts": ["NVIDIA GB300新訂單", "iPhone 17出貨", "美國德州廠"],
-        "risks": ["美中關稅衝擊iPhone", "AI伺服器毛利稀釋"],
-    },
-    "2330.TW": {
-        "name": "台積電", "sector": "半導體代工",
-        "products": ["3nm/2nm先進製程（蘋果/NVIDIA/AMD）", "CoWoS先進封裝（AI唯一量產）", "N2良率爬坡"],
-        "catalysts": ["CoWoS月產能提升", "N2量產確認", "鳳凰城廠"],
-        "risks": ["地緣政治風險", "出口管制升級"],
-    },
-    "2454.TW": {
-        "name": "聯發科", "sector": "IC設計/行動晶片",
-        "products": ["天璣9400旗艦SoC（三星3nm）", "Wi-Fi 7/5G網通（市佔第一）", "車用Dimensity Auto"],
-        "catalysts": ["三星S26採用天璣", "AI手機換機潮", "車用放量"],
-        "risks": ["高通旗艦反攻", "中國手機需求疲軟"],
+        "name": "鴻海", "sector": "AI伺服器／電子代工",
+        "products": [
+            "GB200 NVL72 AI伺服器機架（NVIDIA最大組裝商，全球市佔約40%）",
+            "iPhone代工（全球最大蘋果製造商，佔鴻海營收約50%）",
+            "MIH電動車平台（與Stellantis/裕隆合作）",
+            "液冷散熱模組、電源管理系統",
+        ],
+        "competitors": ["廣達", "緯創", "英業達"],
+        "catalysts": ["NVIDIA GB300/B300新訂單確認", "iPhone 17出貨旺季", "美國德州廠量產", "EV新車款發表"],
+        "risks": ["美中關稅衝擊iPhone組裝成本", "AI伺服器毛利率被稀釋至6%以下", "鄭州廠勞動成本上升"],
     },
     "2382.TW": {
-        "name": "廣達", "sector": "AI伺服器/雲端",
-        "products": ["AI伺服器機架（Meta/Microsoft/Google）", "筆電ODM", "醫療AI設備"],
-        "catalysts": ["Meta AI資本支出擴大", "GB300訂單", "Azure擴產"],
-        "risks": ["客戶集中度高", "筆電市場低迷"],
+        "name": "廣達", "sector": "AI伺服器／雲端硬體",
+        "products": [
+            "AI伺服器機架系統（Meta、Microsoft Azure、Google主要供應商）",
+            "QCT品牌AI運算節點（HGX H100/H200）",
+            "筆電ODM（Dell、HP、Lenovo）",
+            "醫療設備（血液透析機、醫療影像AI系統）",
+        ],
+        "competitors": ["鴻海", "緯創", "英業達"],
+        "catalysts": ["Meta 2026資本支出650億美元計畫", "GB300 NVL72訂單放量", "Azure擴產"],
+        "risks": ["AI伺服器集中少數雲端客戶", "筆電市場持續低迷", "美國關稅轉嫁壓力"],
     },
     "6669.TW": {
         "name": "緯穎", "sector": "超大規模資料中心",
-        "products": ["Microsoft Azure客製伺服器（直供）", "液冷散熱HPC", "儲存Flash Array"],
-        "catalysts": ["Azure FY2025資本支出歷史高", "GB300機架", "液冷放量"],
-        "risks": ["微軟單一客戶>80%", "庫存調整風險"],
+        "products": [
+            "Microsoft Azure客製AI伺服器（直接供應，客戶佔比>80%）",
+            "液冷散熱AI運算節點（DLC直接液冷）",
+            "All-Flash儲存陣列（NVMe SSD）",
+            "Maia 100 AI加速器搭載系統（微軟自研晶片）",
+        ],
+        "competitors": ["鴻海旗下Ingrasys", "廣達QCT"],
+        "catalysts": ["Azure FY2026資本支出歷史新高", "GB300機架出貨", "液冷訂單翻倍"],
+        "risks": ["微軟單一客戶集中度極高", "AI伺服器需求放緩風險", "匯率影響（美元計價）"],
     },
-    "2308.TW": {
-        "name": "台達電", "sector": "電源/工業自動化",
-        "products": ["AI伺服器電源（全球第一）", "EV充電樁（全球前三）", "工業馬達驅動器"],
-        "catalysts": ["AI資料中心電力需求爆發", "EV充電補貼"],
-        "risks": ["匯率損失", "EV競爭加劇"],
+    "2353.TW": {
+        "name": "緯創", "sector": "AI伺服器／筆電ODM",
+        "products": [
+            "AI伺服器（蘋果Mac Pro代工、Dell/HP伺服器）",
+            "筆電ODM（Apple MacBook Pro/Air最大代工商）",
+            "工業電腦、醫療設備",
+        ],
+        "competitors": ["廣達", "鴻海", "英業達"],
+        "catalysts": ["MacBook Air M4換機潮", "AI PC滲透率提升", "伺服器AI升級"],
+        "risks": ["蘋果自製化風險", "筆電市場週期性低谷"],
     },
-    "2379.TW": {
-        "name": "瑞昱", "sector": "IC設計/網通",
-        "products": ["乙太網路NIC（PC/伺服器，全球第一）", "Wi-Fi 7晶片", "100G交換器IC"],
-        "catalysts": ["AI伺服器NIC升級100G", "Wi-Fi 7路由換機潮"],
-        "risks": ["NVIDIA ConnectX搶單", "PC市場慢"],
+    # ── 半導體 ──
+    "2330.TW": {
+        "name": "台積電", "sector": "半導體代工",
+        "products": [
+            "3nm/2nm先進製程（蘋果A系列、NVIDIA Blackwell、AMD MI系列）",
+            "CoWoS先進封裝（AI晶片唯一量產供應商，月產能持續爬坡）",
+            "SoIC 3D異質整合（下世代HPC封裝）",
+            "成熟製程28nm（車用、工業IoT）",
+        ],
+        "competitors": ["三星代工（良率落後）", "Intel Foundry（IFS虧損中）"],
+        "catalysts": ["CoWoS月產能從7萬擴至10萬片", "N2良率突破65%確認", "鳳凰城廠N4量產", "日本熊本廠N6量產"],
+        "risks": ["地緣政治台海風險溢價", "美國《晶片法》補貼條件限制", "先進封裝資本支出過重拖累ROE"],
     },
-    "2345.TW": {
-        "name": "智邦", "sector": "網通設備",
-        "products": ["AI資料中心交換器800G（思科最大ODM）", "白牌交換器雲端直購", "防火牆設備"],
-        "catalysts": ["800G切換加速", "Cisco外包比重提高"],
-        "risks": ["Cisco自製化風險", "庫存調整"],
+    "2454.TW": {
+        "name": "聯發科", "sector": "IC設計／行動晶片",
+        "products": [
+            "天璣9400旗艦SoC（三星3nm製程，內建AI APU算力最強）",
+            "Dimensity Auto車用晶片（L2+自駕、座艙多螢運算）",
+            "Wi-Fi 7/Bluetooth 5.4複合晶片（全球市佔第一）",
+            "ASIC客製AI邊緣推理晶片（新業務）",
+        ],
+        "competitors": ["高通Snapdragon 8 Elite（旗艦機主要對手）", "蘋果A18（直接競爭iPhone）"],
+        "catalysts": ["三星Galaxy S26/小米15 Pro採用天璣確認", "車用晶片Q3進入大量出貨", "AI On-Device手機換機潮加速"],
+        "risks": ["高通以台積電3nm反攻旗艦市場", "中國安卓手機市場需求疲軟", "3nm良率爬坡成本壓力"],
     },
-    "3034.TW": {
-        "name": "聯詠", "sector": "IC設計/顯示驅動",
-        "products": ["OLED顯示驅動IC（三星/LGD主供應商）", "車載顯示IC", "摺疊螢幕DDIC"],
-        "catalysts": ["OLED手機滲透率提升", "車載顯示成長", "摺疊螢幕放量"],
-        "risks": ["面板廠砍資本支出", "中國本土競爭"],
+    "2303.TW": {
+        "name": "聯電", "sector": "成熟製程代工",
+        "products": [
+            "28nm/22nm製程（車用MCU、工業控制器、IoT主力節點）",
+            "40nm/65nm（電源管理IC、觸控晶片）",
+            "UMC Japan 12吋廠（車用嵌入式快閃記憶體）",
+        ],
+        "competitors": ["台積電（下一節點）", "中芯國際（中國市場）", "格芯GlobalFoundries"],
+        "catalysts": ["車用晶片去庫存完成、新訂單回補", "日本廠車用eFlash需求", "AI Edge裝置28nm需求"],
+        "risks": ["28nm中國本土廠（中芯）低價競爭", "車用客戶庫存調整尚未結束", "產能利用率偏低"],
     },
     "3711.TW": {
         "name": "日月光投控", "sector": "半導體封測",
-        "products": ["先進封裝Fan-out/SiP", "HBM配套測試", "汽車晶片封測"],
-        "catalysts": ["HBM4封測訂單", "AI晶片SiP需求"],
-        "risks": ["台積電CoWoS自留擴大", "中國低價競爭"],
+        "products": [
+            "先進封裝Fan-out WLP、Flip Chip（手機/AI SoC）",
+            "SiP系統級封裝（Apple Watch、AirPods）",
+            "HBM記憶體配套測試（CoWoS前後段）",
+            "汽車晶片封測（SiP車用模組）",
+        ],
+        "competitors": ["安靠（Amkor）", "長電科技（中國）"],
+        "catalysts": ["HBM4封測量產訂單", "AI晶片SiP需求爆發", "車用SiP模組出貨成長"],
+        "risks": ["台積電CoWoS自留訂單持續擴大", "中國封測廠低價搶成熟封裝", "先進封裝設備投資回收期長"],
+    },
+    "2337.TW": {
+        "name": "旺宏", "sector": "記憶體（NOR Flash）",
+        "products": [
+            "NOR Flash（汽車ECU韌體儲存，全球第一大供應商）",
+            "工業級NOR Flash（工業IoT、網路設備）",
+            "3D NAND（開發中，尚未量產）",
+        ],
+        "competitors": ["Winbond（華邦電）", "GigaDevice（中國）"],
+        "catalysts": ["汽車NOR Flash去庫存完成、ASP回升", "ADAS/自駕需求帶動NOR容量升級", "MCU搭配需求"],
+        "risks": ["電動車銷售放緩影響車用NOR出貨", "中國GigaDevice低價競爭成熟品", "3D NAND轉型投資風險"],
+    },
+    "2408.TW": {
+        "name": "南亞科", "sector": "DRAM記憶體",
+        "products": [
+            "DDR4/DDR5 DRAM（PC、伺服器、工業用）",
+            "LPDDR4X（行動裝置，量少）",
+            "利基型DRAM（車用、工業用低功耗）",
+        ],
+        "competitors": ["三星（市佔45%）", "SK海力士（市佔30%）", "美光（市佔25%）"],
+        "catalysts": ["DDR5伺服器滲透率突破60%", "AI伺服器DRAM需求帶動ASP上漲", "PC換機週期"],
+        "risks": ["三星DRAM供給過剩壓價", "AI主流記憶體轉向HBM（南亞科無HBM）", "DRAM週期谷底延長"],
+    },
+    # ── 網通/電源 ──
+    "2308.TW": {
+        "name": "台達電", "sector": "電源／工業自動化",
+        "products": [
+            "AI資料中心電源供應器PSU（全球市佔第一，GB200配套）",
+            "工業伺服馬達驅動器（台灣第一、亞洲前三）",
+            "EV充電樁（直流快充，全球前三大供應商）",
+            "太陽能逆變器、工業UPS不斷電系統",
+        ],
+        "competitors": ["Vertiv（IDC電源）", "Eaton", "ABB（工業）"],
+        "catalysts": ["AI資料中心電力密度從40kW→130kW帶動PSU單價翻倍", "EV充電基礎建設補貼落地", "工廠自動化訂單回升"],
+        "risks": ["美元走強侵蝕匯兌收益（台達海外營收佔80%）", "EV充電市場競爭白熱化", "中國工業自動化需求疲軟"],
+    },
+    "2379.TW": {
+        "name": "瑞昱", "sector": "IC設計／網通",
+        "products": [
+            "乙太網路NIC控制器（PC/工作站/伺服器，全球市佔>60%）",
+            "Wi-Fi 7/Bluetooth 5.4複合晶片（路由器、AP）",
+            "2.5G/5G/10G Multi-Gig交換器晶片",
+            "音效編解碼器（主機板ALC系列，幾乎壟斷）",
+        ],
+        "competitors": ["Broadcom（高階交換器）", "Marvell（伺服器NIC高端）", "Intel（網路事業部）"],
+        "catalysts": ["AI伺服器NIC從10G升級到25G/100G（單價5倍）", "Wi-Fi 7家用路由換機潮", "PCIe 5.0 NIC大量出貨"],
+        "risks": ["NVIDIA ConnectX搶走高階AI伺服器NIC份額", "PC市場復甦不如預期", "庫存去化進度落後"],
+    },
+    "2345.TW": {
+        "name": "智邦", "sector": "網通設備製造",
+        "products": [
+            "AI資料中心400G/800G交換器（Cisco最大ODM夥伴）",
+            "白牌交換器（超大規模雲端商直接採購，Meta/Microsoft）",
+            "企業WiFi 6E/7 AP設備",
+            "SD-WAN設備、網路安全裝置",
+        ],
+        "competitors": ["Celestica（加拿大）", "Edgecore正文科技"],
+        "catalysts": ["AI資料中心800G切換進入爆發期", "Cisco ODM外包比重從35%升至50%", "白牌訂單取代品牌產品"],
+        "risks": ["Cisco推動自製化策略風險", "400G→800G過渡期造成庫存調整", "美國關稅影響客戶採購決策"],
+    },
+    # ── 其他科技 ──
+    "3034.TW": {
+        "name": "聯詠", "sector": "IC設計／顯示驅動",
+        "products": [
+            "OLED顯示驅動IC DDIC（三星SDC、LG Display主要供應商）",
+            "TDDI觸控顯示整合驅動IC（中階Android手機）",
+            "車載顯示IC（儀表板、中控娛樂系統）",
+            "摺疊螢幕高更新率DDIC（120Hz/144Hz）",
+        ],
+        "competitors": ["天鈺科技（Raydium）", "Novatek自身為市場領導者"],
+        "catalysts": ["OLED手機全球滲透率突破50%", "三星Galaxy Z Fold7/Flip7摺疊機出貨", "車載顯示需求年增20%"],
+        "risks": ["面板廠資本支出削減影響訂單", "中國本土DDIC廠商（天鈺等）低價競爭", "OLED高端客戶集中三星一家"],
+    },
+    "6415.TW": {
+        "name": "矽力-KY", "sector": "IC設計／類比電源",
+        "products": [
+            "電源管理IC PMIC（手機、AI Edge裝置、IoT）",
+            "DC-DC轉換器、LDO線性穩壓器",
+            "車用電源管理IC（ADAS、車身控制）",
+            "AI伺服器VRM電壓調節模組晶片",
+        ],
+        "competitors": ["德州儀器TI（高端）", "聖邦股份（中國）", "MPS（Monolithic Power）"],
+        "catalysts": ["AI伺服器VRM晶片單台用量是PC的5倍", "車用PMIC進入量產期", "AI手機電源管理升級"],
+        "risks": ["中國聖邦股份持續低價搶消費電子份額", "KY股結構（開曼設立）流動性折扣", "客戶集中度偏高"],
+    },
+    "1590.TW": {
+        "name": "亞德客", "sector": "工業自動化／氣動元件",
+        "products": [
+            "氣壓缸、電磁閥（半導體廠、汽車廠自動化設備標配）",
+            "電動缸、伺服驅動器（智慧製造轉型需求）",
+            "半導體設備專用氣動元件（潔淨室規格）",
+            "醫療設備氣動模組",
+        ],
+        "competitors": ["SMC（日本，市佔第一）", "費斯托Festo（德國）"],
+        "catalysts": ["台灣半導體廠擴廠帶動設備需求", "中國製造業復甦訂單回升", "電動缸新產品放量"],
+        "risks": ["中國自動化設備需求疲軟", "日圓升值壓縮SMC競爭力（但同樣壓縮亞德客相對優勢）", "全球製造業資本支出保守"],
     },
 }
 
 GENERIC_PROFILES = {
     "2303.TW": ("聯電",   "成熟製程代工28nm/40nm，車用/工業/MCU", "半導體代工"),
-    "2337.TW": ("旺宏",   "NOR Flash記憶體，車用IoT最大供應商",  "記憶體"),
-    "1590.TW": ("亞德客", "氣壓自動化元件，工廠/半導體設備",      "工業自動化"),
-    "6415.TW": ("矽力-KY","類比IC/電源管理IC，AI邊緣裝置",        "IC設計"),
-    "2408.TW": ("南亞科", "DRAM記憶體 DDR4/DDR5 PC/伺服器用",      "記憶體"),
 }
 
 
@@ -129,14 +242,14 @@ class StockScreener:
         all_tickers = list(dict.fromkeys(all_tickers))
         t0 = time.time()
 
-        # ── Layer 1：平行量化初篩（全部同時跑）──
-        print(f"[選股 Layer1] 平行量化初篩 {len(all_tickers)} 檔...")
+        # ── Layer 1：平行量化初篩 ──
+        print(f"[Layer1] 平行掃描 {len(all_tickers)} 檔...")
         scored = []
-        with ThreadPoolExecutor(max_workers=6) as pool:
+        with ThreadPoolExecutor(max_workers=4) as pool:  # 配合 Fugle semaphore(2) 用4條線程
             futures = {pool.submit(self._quantitative_score, tk): tk for tk in all_tickers}
             for fut in as_completed(futures):
                 try:
-                    r = fut.result(timeout=15)
+                    r = fut.result(timeout=30)
                     if r:
                         scored.append(r)
                 except Exception as e:
@@ -144,18 +257,16 @@ class StockScreener:
 
         if not scored:
             return {
-                "top5": [],
-                "ai_analysis": "⚠️ 股票資料暫時無法取得\n請 5 分鐘後再試，或傳「潛力股」重新觸發",
-                "scanned_at": datetime.now(TZ).strftime("%Y/%m/%d %H:%M"),
-                "total_scanned": 0,
+                "top5": [], "ai_analysis": "⚠️ 股票資料暫時無法取得\n請 5 分鐘後再試",
+                "scanned_at": datetime.now(TZ).strftime("%Y/%m/%d %H:%M"), "total_scanned": 0,
             }
 
         scored.sort(key=lambda x: x["quant_score"], reverse=True)
-        top5_candidates = scored[:5]   # 直接取 Top5，減少 Claude 負擔
-        print(f"[Layer1] {time.time()-t0:.1f}s  Top5候選：{[s['name'] for s in top5_candidates]}")
+        top15 = scored[:15]
+        print(f"[Layer1] {time.time()-t0:.1f}s  Top15：{[s['name'] for s in top15]}")
 
-        # ── Layer 2+3：平行抓新聞（Top5 同時抓）──
-        print(f"[選股 Layer2+3] 平行抓新聞...")
+        # ── Layer 2+3：平行抓新聞（Top15 同時）──
+        print(f"[Layer2+3] 平行抓新聞 + 產品分析...")
 
         def _enrich(s):
             s["news"]    = self._fetch_stock_news(s["ticker"], s["name"])
@@ -163,22 +274,21 @@ class StockScreener:
             return s
 
         enriched = []
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            futures = [pool.submit(_enrich, s) for s in top5_candidates]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(_enrich, s) for s in top15]
             for fut in as_completed(futures):
                 try:
-                    enriched.append(fut.result(timeout=20))
+                    enriched.append(fut.result(timeout=40))
                 except Exception as e:
                     print(f"  ⚠️ enrich: {e}")
 
-        # 維持原始排序
         enriched.sort(key=lambda x: x["quant_score"], reverse=True)
-        print(f"[Layer2+3] {time.time()-t0:.1f}s  新聞抓取完成")
+        print(f"[Layer2+3] {time.time()-t0:.1f}s  完成")
 
-        # ── Layer 4：Claude 深度分析（只分析 Top5）──
-        print(f"[選股 Layer4] Claude 深度評級中...")
+        # ── Layer 4：Claude 深度評級 ──
+        print(f"[Layer4] Claude 深度分析中...")
         result = self._claude_deep_grade(enriched, scored_count=len(scored))
-        print(f"[Layer4] {time.time()-t0:.1f}s  分析完成")
+        print(f"[Layer4] {time.time()-t0:.1f}s  完成")
 
         return {
             "top5":          result["top5"],
@@ -258,38 +368,43 @@ class StockScreener:
         return {}
 
     # ═══════════════════════════════════════════════════════
-    # Layer 3：抓個股新聞（只用 Google News RSS）
+    # Layer 3：抓個股新聞（Google News RSS，每股最多8則）
     # ═══════════════════════════════════════════════════════
     def _fetch_stock_news(self, ticker: str, name: str) -> list[dict]:
-        import urllib.parse
         items   = []
-        queries = [f"{name} 股票 營收", f"{name} 訂單 財報"]
+        stock_id = ticker.replace(".TW", "")
+        # 三個角度查詢：基本面、訂單/財報、產業面
+        queries = [
+            f"{name} 股票 營收 財報",
+            f"{name} 訂單 出貨 法說",
+            f"{stock_id} {name}",
+        ]
 
         for q in queries:
             try:
                 url  = f"https://news.google.com/rss/search?q={urllib.parse.quote(q)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
                 feed = feedparser.parse(url)
-                for entry in feed.entries[:3]:
-                    title   = re.sub(r"<[^>]+>", "", entry.get("title", ""))
-                    summary = re.sub(r"<[^>]+>", "", entry.get("summary", ""))[:120]
+                for entry in feed.entries[:4]:
+                    title   = re.sub(r"<[^>]+>", "", entry.get("title", "")).strip()
+                    summary = re.sub(r"<[^>]+>", "", entry.get("summary", ""))[:150].strip()
                     if title:
                         items.append({
                             "title":   title,
                             "summary": summary,
-                            "source":  "Google新聞",
+                            "time":    entry.get("published", ""),
                         })
             except Exception:
                 pass
 
-        # 去重
+        # 去重 + 最多回傳8則
         seen, unique = set(), []
         for item in items:
-            key = item["title"][:30]
+            key = item["title"][:35]
             if key not in seen:
                 seen.add(key)
                 unique.append(item)
 
-        return unique[:5]
+        return unique[:8]
 
     # ═══════════════════════════════════════════════════════
     # Layer 4：Claude 深度評級
@@ -335,46 +450,90 @@ class StockScreener:
 {news_text}
 """
 
-        prompt = f"""You are a Taiwan equity analyst. Analyze these {len(stocks)} pre-screened stocks and output a deep report in Traditional Chinese.
+        prompt = f"""You are a senior Taiwan equity research analyst at a top-tier fund. Conduct thorough due diligence on these {len(stocks)} pre-screened stocks.
 
 Today: {today}
 
-ANALYSIS STEPS (do in English first, output Chinese):
-1. PRODUCT CYCLE: Where is each company in its product/demand cycle right now?
-2. NEWS SIGNAL: What do the news headlines actually mean for earnings/orders? (signal vs noise)
-3. TECHNICAL CONFIRM: Does volume/price action match the fundamental story?
-4. GRADE: A+/A/A-/B+/B/B-/C based on 5-day outlook
+YOUR MANDATE: Select the TOP 5 stocks with highest probability of outperforming over the next 5 trading days. Dig deep — don't just repeat the data, INTERPRET it.
 
-PRE-SCREENED DATA:
+ANALYSIS FRAMEWORK (think in English, output Chinese):
+
+Step 1 — PRODUCT CYCLE POSITION
+For each stock: Where exactly is this company in its product/demand cycle? Is demand accelerating, peaking, or declining? What is the TAM and their capture rate? What differentiates them from competitors RIGHT NOW?
+
+Step 2 — NEWS SIGNAL EXTRACTION  
+Read every news headline carefully. Ask: Does this news change the earnings trajectory? Is it a one-time event or structural shift? What would a buy-side analyst think about this? Separate SIGNAL (changes fundamentals) from NOISE (PR/routine).
+
+Step 3 — TECHNICAL × FUNDAMENTAL ALIGNMENT
+Does the price/volume behavior confirm or contradict the fundamental story? High volume breakout + strong fundamental = conviction. Low volume drift + weak fundamental = avoid.
+
+Step 4 — GRADE & RANK
+Assign grade and rank all {len(stocks)} stocks. Then select Top 5 with written conviction.
+
+GRADING SCALE:
+A+ = Strong momentum + imminent catalyst + news confirms + technical breakout → Highest conviction
+A  = Good fundamental setup + price confirming + no major near-term risks
+A- = Solid setup but one concern (valuation stretched OR news mixed OR volume weak)
+B+ = Interesting setup, waiting for one more confirmation signal
+B  = Mixed — some positives but not enough conviction for 5-day hold
+B- = More risks than opportunities near-term
+C  = Clear underperformer for next 5 days, avoid
+
+━━━━━ STOCK DATA ━━━━━
 {stock_blocks}
 
-OUTPUT (全程繁體中文):
+━━━━━ OUTPUT (全程繁體中文) ━━━━━
 
-📊 台股選股報告｜{today}
-掃描 {scored_count} 檔 → 精選前 {len(stocks)} 檔深度分析
+📊 台股深度選股報告
+📅 {today}  量化掃描 {scored_count} 檔 → 深度分析 {len(stocks)} 檔 → 精選 Top 5
 
-{"═"*30}
+{"═"*35}
+🏆 未來5日精選 Top 5
+{"═"*35}
 
-依評級由高到低列出，每檔格式：
+[每檔按以下格式，依評級排序]
 
-【評級 X】股票名稱（代號）$收盤價
-📦 產品分析：核心產品現在在哪個週期？競爭優勢？（2-3句）
-📰 新聞解讀：新聞對營收/訂單的實質影響（區分利多/利空/雜訊，2句）
-📈 量價驗證：技術面與基本面是否吻合？（1句）
-🎯 5日目標：$低點–$高點
-⚡ 催化劑：最可能在5天內發酵的事
-⚠️ 停損條件：若此事發生立刻出場
+【#排名｜評級 X】股票名稱（代號）  現價 $XXX
+─────────────────────────────
+📦 產品週期分析
+  現在位置：（此刻在景氣循環的哪個位置）
+  核心優勢：（為何現在比競爭對手強）
+  需求驅動：（未來6個月的需求來自哪裡）
 
-{"─"*25}
+📰 新聞深度解讀
+  （逐條分析重要新聞，說明對EPS/訂單的實質影響）
+  （明確區分：🟢利多 / 🔴利空 / ⚪雜訊）
 
-💡 本次主線：（這幾檔共同的市場邏輯，1句）
+📈 技術面驗證
+  （量價關係是否與基本面吻合？一句話結論）
 
-⚠️ AI輔助分析，不構成投資建議"""
+📊 量化數據
+  現價 $XXX｜5日報酬 +X.X%｜量比 X.Xx｜RSI XX
+  5日均線 $XXX｜20日均線 $XXX｜成交金額 XXX億
+
+🎯 操作參數
+  5日目標：$XXX – $XXX
+  停損位：$XXX（跌破此價則出場）
+  主要催化劑：（最可能在5天內發酵的1-2件事）
+
+─────────────────────────────
+
+{"═"*35}
+📋 其餘 {len(stocks)-5} 檔評級與未入選原因
+{"═"*35}
+[每檔一行：評級 + 股名（代號）+ 未入選關鍵原因]
+
+{"═"*35}
+💡 本次市場主線
+{"═"*35}
+（這5檔的共同邏輯 + 當前大盤環境解讀，2-3句）
+
+⚠️ 以上為AI量化+基本面深度輔助分析，不構成任何投資建議，請自行評估風險"""
 
         try:
             msg = self.client.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=1500,
+                max_tokens=3500,
                 messages=[{"role": "user", "content": prompt}]
             )
             analysis = msg.content[0].text
