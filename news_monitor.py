@@ -98,12 +98,11 @@ class NewsMonitor:
         # 1. 總經指標
         macro = self._get_macro_indicators()
 
-        # 2. 抓多來源新聞
+        # 2. 抓多來源新聞（Google News RSS + NewsAPI + Alpha Vantage）
         news_items = []
         news_items.extend(self._fetch_google_news())
         news_items.extend(self._fetch_newsapi())
         news_items.extend(self._fetch_alphavantage_news())
-        news_items.extend(self._fetch_yfinance_news())
 
         # 去重（依標題前 40 字）
         seen = set()
@@ -129,38 +128,128 @@ class NewsMonitor:
         }
 
     # ─────────────────────────────────────────
-    # 總經指標
+    # 總經指標（Alpha Vantage 為主，yfinance 備援）
     # ─────────────────────────────────────────
     def _get_macro_indicators(self) -> dict:
         """
-        抓 NASDAQ / SOX / VIX / USD-TWD 即時值
-        用 yfinance，Railway 上完全可用
+        抓 NASDAQ / SOX / VIX / USD-TWD / 美債10Y
+        來源優先順序：
+        1. Alpha Vantage GLOBAL_QUOTE（25次/天免費）
+        2. yfinance（本機可用，Railway 可能被封）
         """
-        tickers = {
+        result = {}
+
+        # ── Alpha Vantage：支援 ETF 和指數作為代理 ──
+        # NASDAQ → QQQ ETF；SOX → SOXX ETF；VIX → 無法，用 VIXY ETF
+        av_symbols = {
+            "nasdaq":  "QQQ",    # NASDAQ 100 追蹤 ETF
+            "sox":     "SOXX",   # 費城半導體 ETF
+            "vix":     "VIXY",   # VIX 短期期貨 ETF（近似值）
+            "usd_twd": None,     # AV 不支援台幣，用 FX 端點
+            "us10y":   None,     # AV 用 TREASURY_YIELD 端點
+        }
+
+        if self.alphavantage_key:
+            for name, symbol in av_symbols.items():
+                if symbol is None:
+                    continue
+                try:
+                    resp = requests.get(
+                        "https://www.alphavantage.co/query",
+                        params={
+                            "function": "GLOBAL_QUOTE",
+                            "symbol":   symbol,
+                            "apikey":   self.alphavantage_key,
+                        },
+                        timeout=8,
+                    )
+                    if resp.status_code == 200:
+                        data  = resp.json().get("Global Quote", {})
+                        price = float(data.get("05. price", 0) or 0)
+                        prev  = float(data.get("08. previous close", 0) or 0)
+                        if price > 0 and prev > 0:
+                            result[name] = {
+                                "price":      round(price, 2),
+                                "change_pct": round((price - prev) / prev * 100, 2),
+                                "source":     "AV",
+                            }
+                except Exception as e:
+                    print(f"  [Macro] AV {name}: {e}")
+
+            # 美債10年期殖利率
+            try:
+                resp = requests.get(
+                    "https://www.alphavantage.co/query",
+                    params={"function": "TREASURY_YIELD", "interval": "daily",
+                            "maturity": "10year", "apikey": self.alphavantage_key},
+                    timeout=8,
+                )
+                if resp.status_code == 200:
+                    data_list = resp.json().get("data", [])
+                    if len(data_list) >= 2:
+                        price = float(data_list[0].get("value", 0) or 0)
+                        prev  = float(data_list[1].get("value", 0) or 0)
+                        if price > 0:
+                            result["us10y"] = {
+                                "price":      round(price, 3),
+                                "change_pct": round((price - prev) / prev * 100, 2) if prev else 0,
+                                "source":     "AV",
+                            }
+            except Exception as e:
+                print(f"  [Macro] AV us10y: {e}")
+
+            # USD/TWD 匯率
+            try:
+                resp = requests.get(
+                    "https://www.alphavantage.co/query",
+                    params={"function": "CURRENCY_EXCHANGE_RATE",
+                            "from_currency": "USD", "to_currency": "TWD",
+                            "apikey": self.alphavantage_key},
+                    timeout=8,
+                )
+                if resp.status_code == 200:
+                    d     = resp.json().get("Realtime Currency Exchange Rate", {})
+                    price = float(d.get("5. Exchange Rate", 0) or 0)
+                    if price > 0:
+                        result["usd_twd"] = {
+                            "price":      round(price, 3),
+                            "change_pct": None,   # AV 匯率沒有前日值
+                            "source":     "AV",
+                        }
+            except Exception as e:
+                print(f"  [Macro] AV usd_twd: {e}")
+
+        # ── yfinance 備援（補齊 AV 沒拿到的）──
+        yf_symbols = {
             "nasdaq":  "^IXIC",
             "sox":     "^SOX",
             "vix":     "^VIX",
             "usd_twd": "TWD=X",
-            "us10y":   "^TNX",    # 美債10年期殖利率
+            "us10y":   "^TNX",
         }
-
-        result = {}
-        for name, symbol in tickers.items():
+        missing = [k for k in yf_symbols if k not in result]
+        if missing:
             try:
-                t  = yf.Ticker(symbol)
-                df = t.history(period="2d")
-                if df.empty:
-                    result[name] = {"price": None, "change_pct": None}
-                    continue
-                price    = df["Close"].iloc[-1]
-                prev     = df["Close"].iloc[-2]
-                chg_pct  = (price - prev) / prev * 100
-                result[name] = {
-                    "price":      round(price, 2),
-                    "change_pct": round(chg_pct, 2),
-                }
-            except Exception as e:
-                result[name] = {"price": None, "change_pct": None}
+                import yfinance as yf
+                for name in missing:
+                    try:
+                        df = yf.Ticker(yf_symbols[name]).history(period="2d", timeout=10)
+                        if not df.empty and len(df) >= 2:
+                            price   = float(df["Close"].iloc[-1])
+                            prev    = float(df["Close"].iloc[-2])
+                            result[name] = {
+                                "price":      round(price, 2),
+                                "change_pct": round((price - prev) / prev * 100, 2),
+                                "source":     "YF",
+                            }
+                    except Exception:
+                        result.setdefault(name, {"price": None, "change_pct": None})
+            except Exception:
+                pass
+
+        # 確保所有 key 都存在
+        for k in ["nasdaq", "sox", "vix", "usd_twd", "us10y"]:
+            result.setdefault(k, {"price": None, "change_pct": None})
 
         return result
 
@@ -354,17 +443,22 @@ class NewsMonitor:
             p = d.get("price")
             c = d.get("change_pct")
             if p is None:
-                return f"{label}：無資料"
-            sign = "▲" if c >= 0 else "▼"
-            return f"{label}：{p} ({sign}{abs(c):.1f}%)"
+                return f"{label}：暫無資料"
+            sign = "▲" if (c or 0) >= 0 else "▼"
+            chg  = f"（{sign}{abs(c):.1f}%）" if c is not None else ""
+            src  = f"[{d.get('source','')}]" if d.get('source') else ""
+            return f"{label}：{p}{chg} {src}"
 
+        has_macro = any(v.get("price") is not None for v in macro.values())
         macro_text = "\n".join([
-            fmt(macro.get("nasdaq",  {}), "那斯達克 NASDAQ"),
-            fmt(macro.get("sox",     {}), "費城半導體 SOX"),
+            fmt(macro.get("nasdaq",  {}), "那斯達克 QQQ"),
+            fmt(macro.get("sox",     {}), "費城半導體 SOXX"),
             fmt(macro.get("vix",     {}), "恐慌指數 VIX"),
             fmt(macro.get("usd_twd", {}), "美元兌新台幣"),
             fmt(macro.get("us10y",   {}), "美債10年期殖利率"),
         ])
+        if not has_macro:
+            macro_text += "\n\n⚠️ 總經數據暫時無法取得，請在 Railway Variables 確認 ALPHAVANTAGE_KEY 已填入"
 
         # 整理新聞文字（最多15則）
         news_text = ""
@@ -473,10 +567,11 @@ Now analyze and output ENTIRELY in Traditional Chinese:
             p = d.get("price")
             c = d.get("change_pct")
             if p is None:
-                return f"{label}：無資料"
-            sign  = "▲" if c >= 0 else "▼"
-            color = "🔴" if c >= 0 else "🟢"
-            return f"{color} {label}：{p}{unit}（{sign}{abs(c):.1f}%）"
+                return f"➖ {label}：暫無資料"
+            color = "🔴" if (c or 0) >= 0 else "🟢"
+            sign  = "▲" if (c or 0) >= 0 else "▼"
+            chg   = f"（{sign}{abs(c):.1f}%）" if c is not None else ""
+            return f"{color} {label}：{p}{unit}{chg}"
 
         header = (
             f"🌐 外部市場情報  {now}\n\n"
